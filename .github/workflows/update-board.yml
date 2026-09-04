@@ -13,33 +13,110 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch framework odds boards
+      - name: Fetch compact framework odds boards
+        shell: bash
         run: |
           fetch_board () {
             league="$1"
             file="$2"
             label="$3"
 
-            if curl -fL --retry 3 \
-              "https://gamemode-80wa.onrender.com/board?leagueID=${league}" \
-              -o "${file}"; then
-              echo "${label} board updated"
+            url="https://gamemode-80wa.onrender.com/board?leagueID=${league}"
+
+            if curl -fL --retry 3 --max-time 90 "$url" -o full-board.html; then
+              python3 - "$file" "$label" <<'PY'
+import sys
+import re
+import html
+
+outfile = sys.argv[1]
+label = sys.argv[2]
+
+with open("full-board.html", "r", encoding="utf-8", errors="replace") as f:
+    source = f.read()
+
+# Pull basic event headings, start times, and odds text from
+# the existing GameMode board while removing bulky HTML.
+sections = re.findall(
+    r"<section>(.*?)</section>",
+    source,
+    flags=re.I | re.S
+)
+
+items = []
+
+for section in sections[:25]:
+    heading = re.search(r"<h2>(.*?)</h2>", section, flags=re.I | re.S)
+    start = re.search(
+        r"<strong>Start:</strong>\s*(.*?)</p>",
+        section,
+        flags=re.I | re.S
+    )
+    pre = re.search(r"<pre>(.*?)</pre>", section, flags=re.I | re.S)
+
+    if not heading:
+        continue
+
+    game = re.sub(r"<[^>]+>", "", heading.group(1)).strip()
+    start_text = (
+        re.sub(r"<[^>]+>", "", start.group(1)).strip()
+        if start else ""
+    )
+
+    odds_text = html.unescape(pre.group(1)) if pre else ""
+    # Keep the snapshot manageable for GitHub Pages / ChatGPT.
+    odds_text = odds_text[:50000]
+
+    items.append((game, start_text, odds_text))
+
+with open(outfile, "w", encoding="utf-8") as out:
+    out.write("""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="index,follow">
+<title>GameMode %s Odds Board</title>
+</head>
+<body>
+<h1>GameMode %s Odds Board</h1>
+<p>Public read-only market snapshot.</p>
+""" % (html.escape(label), html.escape(label)))
+
+    if not items:
+        out.write("<p>No current events available.</p>\n")
+
+    for game, start_text, odds_text in items:
+        out.write("<section>\n")
+        out.write("<h2>%s</h2>\n" % html.escape(game))
+        if start_text:
+            out.write("<p><strong>Start:</strong> %s</p>\n" %
+                      html.escape(start_text))
+        out.write("<pre>%s</pre>\n" % html.escape(odds_text))
+        out.write("</section>\n")
+
+    out.write("</body></html>\n")
+PY
+
+              echo "${label} compact board updated"
             else
-              cat > "${file}" <<EOF
-          <!doctype html>
-          <html>
-          <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>${label} Odds Board</title>
-          </head>
-          <body>
-            <h1>${label} Odds Board</h1>
-            <p>Board currently unavailable. Try the next update.</p>
-          </body>
-          </html>
-          EOF
+              cat > "$file" <<EOF
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="index,follow">
+<title>${label} Board</title>
+</head>
+<body>
+<h1>${label} Odds Board</h1>
+<p>Board currently unavailable.</p>
+</body>
+</html>
+EOF
             fi
+
+            rm -f full-board.html
           }
 
           fetch_board MLB mlb.html MLB
@@ -56,7 +133,7 @@ jobs:
           <html>
           <head>
             <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <meta name="viewport" content="width=device-width,initial-scale=1">
             <meta name="robots" content="index,follow">
             <title>GameMode Sports Odds Board</title>
           </head>
@@ -80,5 +157,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add index.html mlb.html nfl.html nba.html wnba.html ncaaf.html ncaab.html
-          git diff --cached --quiet || git commit -m "Update sports odds boards"
+          git diff --cached --quiet || git commit -m "Update compact sports odds boards"
           git push
