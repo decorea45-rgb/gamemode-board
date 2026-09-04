@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://decorea45-rgb.github.io/gamemode-board/sitemap.xml
