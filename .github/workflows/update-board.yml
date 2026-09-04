@@ -14,13 +14,12 @@ jobs:
 
       - name: Fetch framework odds boards
         run: |
-          curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=MLB" -o mlb.html
-          curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=NFL" -o nfl.html
-          curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=NBA" -o nba.html
-          curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=WNBA" -o wnba.html
-          curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=NCAAF" -o ncaaf.html
-          curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=NCAAB" -o ncaab.html
-
+curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=MLB" -o mlb.html || true
+curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=NFL" -o nfl.html || true
+curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=NBA" -o nba.html || true
+curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=WNBA" -o wnba.html || true
+curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=NCAAF" -o ncaaf.html || true
+curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=NCAAB" -o ncaab.html || true
       - name: Build index page
         run: |
           cat > index.html <<'EOF'
