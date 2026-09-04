@@ -43,7 +43,7 @@ jobs:
 
                 grep -E \
                   '<h2>|<strong>Start:</strong>|"marketName"|"odds"|"bookOdds"|"fairOdds"|"spread"|"overUnder"|"available"|"deeplink"|"fanduel"' \
-                  full-board.html | head -n 2500 || true
+                   full-board.html
 
                 printf '  </pre>\n'
                 printf '</body>\n'
