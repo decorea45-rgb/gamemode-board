@@ -15,12 +15,39 @@ jobs:
 
       - name: Fetch framework odds boards
         run: |
-          curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=MLB" -o mlb.html || true
-          curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=NFL" -o nfl.html || true
-          curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=NBA" -o nba.html || true
-          curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=WNBA" -o wnba.html || true
-          curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=NCAAF" -o ncaaf.html || true
-          curl -fL --retry 3 "https://gamemode-80wa.onrender.com/board?leagueID=NCAAB" -o ncaab.html || true
+          fetch_board () {
+            league="$1"
+            file="$2"
+            label="$3"
+
+            if curl -fL --retry 3 \
+              "https://gamemode-80wa.onrender.com/board?leagueID=${league}" \
+              -o "${file}"; then
+              echo "${label} board updated"
+            else
+              cat > "${file}" <<EOF
+          <!doctype html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>${label} Odds Board</title>
+          </head>
+          <body>
+            <h1>${label} Odds Board</h1>
+            <p>Board currently unavailable. Try the next update.</p>
+          </body>
+          </html>
+          EOF
+            fi
+          }
+
+          fetch_board MLB mlb.html MLB
+          fetch_board NFL nfl.html NFL
+          fetch_board NBA nba.html NBA
+          fetch_board WNBA wnba.html WNBA
+          fetch_board NCAAF ncaaf.html "College Football"
+          fetch_board NCAAB ncaab.html "College Basketball"
 
       - name: Build index page
         run: |
