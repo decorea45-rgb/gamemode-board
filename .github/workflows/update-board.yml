@@ -11,6 +11,10 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: gamemode-board-refresh
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -22,12 +26,33 @@ jobs:
             file="$2"
             label="$3"
 
-            if curl -fL --retry 3 --retry-all-errors --retry-delay 5 --max-time 180 \
+            if curl -fL --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 120 --connect-timeout 20 --max-time 240 \
               "https://gamemode-80wa.onrender.com/board?leagueID=${league}&windowHours=36" \
               -o full-board.html; then
 
-              if ! grep -q '<strong>Coverage Complete:</strong> yes' full-board.html; then
+              updated="$(sed -n 's/.*<strong>Updated:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
+              event_count="$(sed -n 's/.*<strong>Event Count:<\/strong>[[:space:]]*\([0-9][0-9]*\).*/\1/p' full-board.html | head -n1)"
+              coverage="$(sed -n 's/.*<strong>Coverage Complete:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
+              pages="$(sed -n 's/.*<strong>Pages Fetched:<\/strong>[[:space:]]*\([0-9][0-9]*\).*/\1/p' full-board.html | head -n1)"
+              window="$(sed -n 's/.*<strong>Window Hours:<\/strong>[[:space:]]*\([0-9][0-9]*\).*/\1/p' full-board.html | head -n1)"
+              matchup_count="$(grep -c '<h2>' full-board.html || true)"
+
+              echo "ACCEPTANCE ${label}: updated=${updated:-missing} events=${event_count:-missing} matchups=${matchup_count:-0} coverage=${coverage:-missing} pages=${pages:-missing} windowHours=${window:-missing} bytes=$(wc -c < full-board.html)"
+
+              if [ "$coverage" != "yes" ]; then
                 echo "WARNING: ${label} board reported incomplete pagination; preserving previous ${file}"
+                rm -f full-board.html "${file}.new"
+                return 0
+              fi
+
+              if ! [[ "$event_count" =~ ^[0-9]+$ ]] || ! [[ "$pages" =~ ^[0-9]+$ ]] || ! [[ "$window" =~ ^[0-9]+$ ]]; then
+                echo "WARNING: ${label} board metadata was malformed or missing; preserving previous ${file}"
+                rm -f full-board.html "${file}.new"
+                return 0
+              fi
+
+              if [ "$event_count" -ne "$matchup_count" ]; then
+                echo "WARNING: ${label} event-count/matchup-count mismatch (${event_count} vs ${matchup_count}); preserving previous ${file}"
                 rm -f full-board.html "${file}.new"
                 return 0
               fi
@@ -62,7 +87,7 @@ jobs:
               mv "${file}.new" "$file"
               echo "${label} board updated"
             else
-              echo "WARNING: ${label} fetch failed; preserving previous ${file} instead of overwriting it"
+              echo "WARNING: ${label} fetch failed after retries; preserving previous ${file} instead of overwriting it"
             fi
 
             rm -f full-board.html "${file}.new"
