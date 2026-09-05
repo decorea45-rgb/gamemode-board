@@ -22,9 +22,15 @@ jobs:
             file="$2"
             label="$3"
 
-            if curl -fL --retry 3 --retry-all-errors --retry-delay 5 --max-time 90 \
-              "https://gamemode-80wa.onrender.com/board?leagueID=${league}" \
+            if curl -fL --retry 3 --retry-all-errors --retry-delay 5 --max-time 180 \
+              "https://gamemode-80wa.onrender.com/board?leagueID=${league}&windowHours=36" \
               -o full-board.html; then
+
+              if ! grep -q '<strong>Coverage Complete:</strong> yes' full-board.html; then
+                echo "WARNING: ${label} board reported incomplete pagination; preserving previous ${file}"
+                rm -f full-board.html "${file}.new"
+                return 0
+              fi
 
               {
                 printf '<!doctype html>\n'
@@ -45,7 +51,7 @@ jobs:
                 printf '  <pre>\n'
 
                 grep -E \
-                  '<h2>|<strong>Start:</strong>|"marketName"|"odds"|"bookOdds"|"fairOdds"|"spread"|"overUnder"|"available"|"deeplink"|"fanduel"' \
+                  '<strong>Updated:</strong>|<strong>Event Count:</strong>|<strong>Coverage Complete:</strong>|<strong>Pages Fetched:</strong>|<strong>Window Hours:</strong>|<h2>|<strong>Start:</strong>|"marketName"|"odds"|"bookOdds"|"fairOdds"|"spread"|"overUnder"|"available"|"deeplink"|"fanduel"' \
                   full-board.html || true
 
                 printf '  </pre>\n'
