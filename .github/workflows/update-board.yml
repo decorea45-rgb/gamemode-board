@@ -25,7 +25,7 @@ jobs:
       - name: Verify deployed GameMode backend version
         shell: bash
         run: |
-          expected="1.5.1"
+          expected="1.5.2"
           for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
             health="$(curl -fsSL --connect-timeout 15 --max-time 30 https://gamemode-80wa.onrender.com/health || true)"
             version="$(printf '%s' "$health" | sed -n 's/.*"boardVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
