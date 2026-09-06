@@ -25,7 +25,7 @@ jobs:
       - name: Verify deployed GameMode backend version
         shell: bash
         run: |
-          expected="1.5.0"
+          expected="1.5.1"
           for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
             health="$(curl -fsSL --connect-timeout 15 --max-time 30 https://gamemode-80wa.onrender.com/health || true)"
             version="$(printf '%s' "$health" | sed -n 's/.*"boardVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
@@ -65,7 +65,6 @@ jobs:
             fi
 
             updated="$(sed -n 's/.*<strong>Updated:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
-            board_state="$(sed -n 's/.*<strong>Board State:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
             event_count="$(sed -n 's/.*<strong>Event Count:<\/strong>[[:space:]]*\([0-9][0-9]*\).*/\1/p' full-board.html | head -n1)"
             coverage="$(sed -n 's/.*<strong>Coverage Complete:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
             pages="$(sed -n 's/.*<strong>Pages Fetched:<\/strong>[[:space:]]*\([0-9][0-9]*\).*/\1/p' full-board.html | head -n1)"
@@ -73,40 +72,31 @@ jobs:
             source_mode="$(sed -n 's/.*<strong>Source Mode:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
             matchup_count="$(grep -c '<h2>' full-board.html || true)"
 
-            echo "ACCEPTANCE ${label}: state=${board_state:-missing} updated=${updated:-missing} events=${event_count:-missing} matchups=${matchup_count:-0} coverage=${coverage:-missing} pages=${pages:-missing} windowHours=${window:-missing} sourceMode=${source_mode:-missing}"
+            echo "ACCEPTANCE ${label}: updated=${updated:-missing} events=${event_count:-missing} matchups=${matchup_count:-0} coverage=${coverage:-missing} pages=${pages:-missing} windowHours=${window:-missing} sourceMode=${source_mode:-missing}"
 
-            if [ "$board_state" = "unavailable" ]; then
-              if [ "$source_mode" != "provider-entitlement-unavailable" ] || [ "$event_count" != "0" ]; then
-                echo "::warning::${label} unavailable state malformed; preserving previous ${file}"
-                touch .refresh-failed
-                rm -f full-board.html "${file}.new"
-                return 0
-              fi
-            else
-              if [ "$coverage" != "yes" ]; then
-                echo "::warning::${label} incomplete coverage; preserving previous ${file}"
-                touch .refresh-failed
-                rm -f full-board.html "${file}.new"
-                return 0
-              fi
-              if ! [[ "$event_count" =~ ^[0-9]+$ ]] || ! [[ "$pages" =~ ^[0-9]+$ ]] || ! [[ "$window" =~ ^[0-9]+$ ]]; then
-                echo "::warning::${label} malformed metadata; preserving previous ${file}"
-                touch .refresh-failed
-                rm -f full-board.html "${file}.new"
-                return 0
-              fi
-              if [ "$event_count" -ne "$matchup_count" ]; then
-                echo "::warning::${label} event/matchup mismatch; preserving previous ${file}"
-                touch .refresh-failed
-                rm -f full-board.html "${file}.new"
-                return 0
-              fi
+            if [ -z "$updated" ] || [ "$coverage" != "yes" ]; then
+              echo "::warning::${label} missing/stale-form metadata or incomplete coverage; preserving previous ${file}"
+              touch .refresh-failed
+              rm -f full-board.html "${file}.new"
+              return 0
+            fi
+            if ! [[ "$event_count" =~ ^[0-9]+$ ]] || ! [[ "$pages" =~ ^[0-9]+$ ]] || ! [[ "$window" =~ ^[0-9]+$ ]] || [ -z "$source_mode" ]; then
+              echo "::warning::${label} malformed metadata; preserving previous ${file}"
+              touch .refresh-failed
+              rm -f full-board.html "${file}.new"
+              return 0
+            fi
+            if [ "$event_count" -ne "$matchup_count" ]; then
+              echo "::warning::${label} event/matchup mismatch; preserving previous ${file}"
+              touch .refresh-failed
+              rm -f full-board.html "${file}.new"
+              return 0
             fi
 
             {
-              printf '<!doctype html>\n<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>GameMode %s Odds Board</title></head><body>\n' "$label"
+              printf '<!doctype html>\n<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0"><title>GameMode %s Odds Board</title></head><body>\n' "$label"
               printf '<h1>GameMode %s Odds Board</h1>\n<p>Compact read-only market snapshot.</p>\n<p>Generated: %s</p>\n<pre>\n' "$label" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-              grep -E '<strong>Updated:</strong>|<strong>Board State:</strong>|<strong>Event Count:</strong>|<strong>Coverage Complete:</strong>|<strong>Pages Fetched:</strong>|<strong>Window Hours:</strong>|<strong>Source Mode:</strong>|<strong>Provider Status:</strong>|<h2>|<strong>Start:</strong>|"marketName"|"odds"|"bookOdds"|"fairOdds"|"spread"|"overUnder"|"available"|"deeplink"|"fanduel"' full-board.html || true
+              grep -E '<strong>Updated:</strong>|<strong>Event Count:</strong>|<strong>Coverage Complete:</strong>|<strong>Pages Fetched:</strong>|<strong>Window Hours:</strong>|<strong>Source Mode:</strong>|<h2>|<strong>Start:</strong>|"marketName"|"odds"|"bookOdds"|"fairOdds"|"spread"|"overUnder"|"available"|"deeplink"|"fanduel"' full-board.html || true
               printf '</pre></body></html>\n'
             } > "${file}.new"
 
@@ -126,7 +116,7 @@ jobs:
         run: |
           version="$(date -u +%Y%m%d%H%M%S)"
           cat > index.html <<EOF
-          <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>GameMode Sports Odds Board</title></head><body>
+          <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0"><title>GameMode Sports Odds Board</title></head><body>
           <h1>GameMode Sports Odds Board</h1><p>Public read-only compact market snapshots.</p><p>Index generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')</p><ul>
           <li><a href="mlb.html?v=${version}">MLB</a></li><li><a href="nfl.html?v=${version}">NFL</a></li><li><a href="nba.html?v=${version}">NBA</a></li><li><a href="wnba.html?v=${version}">WNBA</a></li><li><a href="ncaaf.html?v=${version}">College Football</a></li><li><a href="ncaab.html?v=${version}">College Basketball</a></li>
           </ul></body></html>
@@ -150,7 +140,7 @@ jobs:
         shell: bash
         run: |
           if [ -f .refresh-failed ]; then
-            echo "One or more league refreshes genuinely failed or were incomplete."
+            echo "One or more league refreshes genuinely failed or were incomplete. Successful leagues were published and prior valid failed-league boards were preserved."
             exit 1
           fi
-          echo "All league refreshes completed with either valid market data, readable-empty, or explicit provider-entitlement unavailable state."
+          echo "All league refreshes completed with valid complete board metadata."
