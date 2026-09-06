@@ -2,6 +2,10 @@ name: Update odds boards
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/update-board.yml"
   schedule:
     - cron: "17,47 * * * *"
 
@@ -17,6 +21,23 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify deployed GameMode backend version
+        shell: bash
+        run: |
+          expected="1.3.1"
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            health="$(curl -fsSL --connect-timeout 15 --max-time 30 https://gamemode-80wa.onrender.com/health || true)"
+            version="$(printf '%s' "$health" | sed -n 's/.*"boardVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            echo "BACKEND PREFLIGHT attempt=${attempt} expected=${expected} observed=${version:-unavailable}"
+            if [ "$version" = "$expected" ]; then
+              echo "Deployed GameMode backend ${expected} confirmed."
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::GameMode backend ${expected} was not observed after preflight wait; refusing to certify a stale deployment."
+          exit 1
 
       - name: Fetch compact framework odds boards
         shell: bash
