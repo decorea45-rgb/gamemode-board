@@ -148,8 +148,19 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add index.html mlb.html nfl.html nba.html wnba.html ncaaf.html ncaab.html
-          git diff --cached --quiet || git commit -m "Update compact odds boards"
-          git push
+          if ! git diff --cached --quiet; then
+            git commit -m "Update compact odds boards"
+            # A human or repair commit can land on main while this job is
+            # fetching boards. Rebase the generated-board commit onto the
+            # newest main before pushing. Non-overlapping admin/workflow
+            # changes are preserved; a true same-file conflict fails closed.
+            git pull --rebase origin main
+            git push
+          else
+            # Even with no board changes, confirm the local ref is not silently
+            # stale. No push is required when there is nothing to publish.
+            git fetch origin main
+          fi
 
       - name: Verify refresh completeness
         shell: bash
