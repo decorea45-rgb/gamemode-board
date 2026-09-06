@@ -21,6 +21,8 @@ jobs:
       - name: Fetch compact framework odds boards
         shell: bash
         run: |
+          rm -f .refresh-failed
+
           fetch_board () {
             league="$1"
             file="$2"
@@ -40,19 +42,22 @@ jobs:
               echo "ACCEPTANCE ${label}: updated=${updated:-missing} events=${event_count:-missing} matchups=${matchup_count:-0} coverage=${coverage:-missing} pages=${pages:-missing} windowHours=${window:-missing} bytes=$(wc -c < full-board.html)"
 
               if [ "$coverage" != "yes" ]; then
-                echo "WARNING: ${label} board reported incomplete pagination; preserving previous ${file}"
+                echo "::warning::${label} board reported incomplete pagination; preserving previous ${file}"
+                touch .refresh-failed
                 rm -f full-board.html "${file}.new"
                 return 0
               fi
 
               if ! [[ "$event_count" =~ ^[0-9]+$ ]] || ! [[ "$pages" =~ ^[0-9]+$ ]] || ! [[ "$window" =~ ^[0-9]+$ ]]; then
-                echo "WARNING: ${label} board metadata was malformed or missing; preserving previous ${file}"
+                echo "::warning::${label} board metadata was malformed or missing; preserving previous ${file}"
+                touch .refresh-failed
                 rm -f full-board.html "${file}.new"
                 return 0
               fi
 
               if [ "$event_count" -ne "$matchup_count" ]; then
-                echo "WARNING: ${label} event-count/matchup-count mismatch (${event_count} vs ${matchup_count}); preserving previous ${file}"
+                echo "::warning::${label} event-count/matchup-count mismatch (${event_count} vs ${matchup_count}); preserving previous ${file}"
+                touch .refresh-failed
                 rm -f full-board.html "${file}.new"
                 return 0
               fi
@@ -87,7 +92,8 @@ jobs:
               mv "${file}.new" "$file"
               echo "${label} board updated"
             else
-              echo "WARNING: ${label} fetch failed after retries; preserving previous ${file} instead of overwriting it"
+              echo "::warning::${label} fetch failed after retries; preserving previous ${file} instead of overwriting it"
+              touch .refresh-failed
             fi
 
             rm -f full-board.html "${file}.new"
@@ -119,7 +125,7 @@ jobs:
             '<body>' \
             '  <h1>GameMode Sports Odds Board</h1>' \
             '  <p>Public read-only compact market snapshots.</p>' \
-            "  <p>Updated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')</p>" \
+            "  <p>Index generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')</p>" \
             '  <ul>' \
             "    <li><a href=\"mlb.html?v=${version}\">MLB</a></li>" \
             "    <li><a href=\"nfl.html?v=${version}\">NFL</a></li>" \
@@ -139,3 +145,12 @@ jobs:
           git add index.html mlb.html nfl.html nba.html wnba.html ncaaf.html ncaab.html
           git diff --cached --quiet || git commit -m "Update compact odds boards"
           git push
+
+      - name: Verify refresh completeness
+        shell: bash
+        run: |
+          if [ -f .refresh-failed ]; then
+            echo "One or more league refreshes failed or were incomplete. Successful league updates were published and prior valid boards were preserved for failed leagues."
+            exit 1
+          fi
+          echo "All league refreshes completed with valid board metadata."
