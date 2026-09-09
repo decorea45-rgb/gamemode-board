@@ -8,6 +8,7 @@ on:
       - ".github/workflows/update-board.yml"
   schedule:
     - cron: "17,47 * * * *"
+    - cron: "27,57 * * * *"
 
 permissions:
   contents: write
@@ -22,7 +23,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Decide whether fallback refresh is needed
+        id: refresh_gate
+        shell: bash
+        run: |
+          run_refresh=true
+          trigger_schedule="${{ github.event.schedule }}"
+          echo "Trigger event=${{ github.event_name }} schedule=${trigger_schedule:-n/a}"
+
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$trigger_schedule" = "27,57 * * * *" ]; then
+            last_generated="$(sed -n 's/.*Index generated: \([^<]*\).*/\1/p' index.html | head -n1)"
+            if [ -n "$last_generated" ]; then
+              last_epoch="$(date -u -d "$last_generated" +%s 2>/dev/null || echo 0)"
+              now_epoch="$(date -u +%s)"
+              age_seconds=$((now_epoch - last_epoch))
+              echo "Fallback freshness check: last_generated=${last_generated} age_seconds=${age_seconds}"
+              if [ "$last_epoch" -gt 0 ] && [ "$age_seconds" -ge 0 ] && [ "$age_seconds" -lt 1200 ]; then
+                run_refresh=false
+                echo "Primary refresh is recent; guarded fallback will exit cleanly without duplicating work."
+              fi
+            fi
+          fi
+
+          echo "run_refresh=$run_refresh" >> "$GITHUB_OUTPUT"
+
       - name: Verify deployed GameMode backend version
+        if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
           expected="1.5.2"
@@ -40,6 +66,7 @@ jobs:
           exit 1
 
       - name: Capture WNBA provider diagnostics
+        if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
           curl -fsSL --connect-timeout 20 --max-time 120 \
@@ -47,6 +74,7 @@ jobs:
             || echo "::warning::WNBA diagnostic endpoint unavailable"
 
       - name: Fetch compact framework odds boards
+        if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
           rm -f .refresh-failed
@@ -124,6 +152,7 @@ jobs:
           fetch_board NCAAB ncaab.html "College Basketball"
 
       - name: Build index page
+        if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
           version="$(date -u +%Y%m%d%H%M%S)"
@@ -135,6 +164,7 @@ jobs:
           EOF
 
       - name: Publish updated boards
+        if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
@@ -149,6 +179,7 @@ jobs:
           fi
 
       - name: Verify refresh completeness
+        if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
           if [ -f .refresh-failed ]; then
@@ -156,3 +187,9 @@ jobs:
             exit 1
           fi
           echo "All league refreshes completed with valid complete board metadata."
+
+      - name: Guarded fallback skipped
+        if: steps.refresh_gate.outputs.run_refresh != 'true'
+        shell: bash
+        run: |
+          echo "Fallback schedule fired, but a recent successful board publication already exists. No duplicate refresh needed."
