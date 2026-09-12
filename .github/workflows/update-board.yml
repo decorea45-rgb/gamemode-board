@@ -16,7 +16,7 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     concurrency:
       group: gamemode-board-refresh
       cancel-in-progress: false
@@ -31,23 +31,27 @@ jobs:
           trigger_schedule="${{ github.event.schedule }}"
           echo "Trigger event=${{ github.event_name }} schedule=${trigger_schedule:-n/a}"
 
+          # IMPORTANT: fallback freshness is based only on the last COMPLETE
+          # six-league refresh. A failed/partial run must never suppress recovery.
           if [ "${{ github.event_name }}" = "schedule" ] && [ "$trigger_schedule" = "27,57 * * * *" ]; then
-            last_generated="$(sed -n 's/.*Index generated: \([^<]*\).*/\1/p' index.html | head -n1)"
-            if [ -n "$last_generated" ]; then
-              last_epoch="$(date -u -d "$last_generated" +%s 2>/dev/null || echo 0)"
+            if [ -f last-successful-refresh.txt ]; then
+              last_success="$(head -n1 last-successful-refresh.txt | tr -d '\r\n')"
+              last_epoch="$(date -u -d "$last_success" +%s 2>/dev/null || echo 0)"
               now_epoch="$(date -u +%s)"
               age_seconds=$((now_epoch - last_epoch))
-              echo "Fallback freshness check: last_generated=${last_generated} age_seconds=${age_seconds}"
+              echo "Fallback complete-refresh check: last_success=${last_success:-missing} age_seconds=${age_seconds}"
               if [ "$last_epoch" -gt 0 ] && [ "$age_seconds" -ge 0 ] && [ "$age_seconds" -lt 1200 ]; then
                 run_refresh=false
-                echo "Primary refresh is recent; guarded fallback will exit cleanly without duplicating work."
+                echo "A complete six-league refresh is recent; guarded fallback can exit cleanly."
               fi
+            else
+              echo "No complete-refresh marker exists; fallback will run."
             fi
           fi
 
           echo "run_refresh=$run_refresh" >> "$GITHUB_OUTPUT"
 
-      - name: Verify deployed GameMode backend version
+      - name: Verify and warm deployed GameMode backend
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
@@ -57,7 +61,9 @@ jobs:
             version="$(printf '%s' "$health" | sed -n 's/.*"boardVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
             echo "BACKEND PREFLIGHT attempt=${attempt} expected=${expected} observed=${version:-unavailable}"
             if [ "$version" = "$expected" ]; then
-              echo "Deployed GameMode backend ${expected} confirmed."
+              echo "Deployed GameMode backend ${expected} confirmed and warm."
+              # Give the provider path a short quiet period before board traffic.
+              sleep 8
               exit 0
             fi
             sleep 15
@@ -65,100 +71,141 @@ jobs:
           echo "::error::GameMode backend ${expected} was not observed after preflight wait."
           exit 1
 
-      - name: Capture WNBA provider diagnostics
+      - name: Fetch compact framework odds boards with recovery
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
-          curl -fsSL --connect-timeout 20 --max-time 120 \
-            "https://gamemode-80wa.onrender.com/diagnostics/board?leagueID=WNBA&windowHours=36" \
-            || echo "::warning::WNBA diagnostic endpoint unavailable"
-
-      - name: Fetch compact framework odds boards
-        if: steps.refresh_gate.outputs.run_refresh == 'true'
-        shell: bash
-        run: |
-          rm -f .refresh-failed
+          rm -f .refresh-failed .refresh-attempts
 
           fetch_board () {
             league="$1"
             file="$2"
             label="$3"
+            success=false
 
-            if ! curl -fL --retry 1 --retry-all-errors --retry-delay 5 --retry-max-time 30 --connect-timeout 20 --max-time 240 \
-              "https://gamemode-80wa.onrender.com/board?leagueID=${league}&windowHours=36" -o full-board.html; then
-              echo "::warning::${label} fetch failed; preserving previous ${file}"
-              touch .refresh-failed
+            for attempt in 1 2 3 4; do
               rm -f full-board.html "${file}.new"
+              http_code="$(curl -sS -L --connect-timeout 20 --max-time 240 \
+                -o full-board.html -w '%{http_code}' \
+                "https://gamemode-80wa.onrender.com/board?leagueID=${league}&windowHours=36" || true)"
+              [ -n "$http_code" ] || http_code="000"
+              echo "FETCH ${label}: attempt=${attempt} http=${http_code}"
+
+              if [ "$http_code" = "200" ] && [ -s full-board.html ]; then
+                updated="$(sed -n 's/.*<strong>Updated:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
+                board_state="$(sed -n 's/.*<strong>Board State:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
+                event_count="$(sed -n 's/.*<strong>Event Count:<\/strong>[[:space:]]*\([0-9][0-9]*\).*/\1/p' full-board.html | head -n1)"
+                coverage="$(sed -n 's/.*<strong>Coverage Complete:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
+                pages="$(sed -n 's/.*<strong>Pages Fetched:<\/strong>[[:space:]]*\([0-9][0-9]*\).*/\1/p' full-board.html | head -n1)"
+                window="$(sed -n 's/.*<strong>Window Hours:<\/strong>[[:space:]]*\([0-9][0-9]*\).*/\1/p' full-board.html | head -n1)"
+                source_mode="$(sed -n 's/.*<strong>Source Mode:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
+                matchup_count="$(grep -c '<h2>' full-board.html || true)"
+
+                echo "ACCEPTANCE ${label}: updated=${updated:-missing} state=${board_state:-missing} events=${event_count:-missing} matchups=${matchup_count:-0} coverage=${coverage:-missing} pages=${pages:-missing} windowHours=${window:-missing} sourceMode=${source_mode:-missing}"
+
+                metadata_ok=true
+                if [ -z "$updated" ] || ! [[ "$event_count" =~ ^[0-9]+$ ]] || ! [[ "$pages" =~ ^[0-9]+$ ]] || ! [[ "$window" =~ ^[0-9]+$ ]] || [ -z "$board_state" ] || [ -z "$source_mode" ]; then
+                  metadata_ok=false
+                  echo "::warning::${label} malformed metadata on attempt ${attempt}."
+                elif [ "$board_state" = "unavailable" ]; then
+                  if [ "$source_mode" != "provider-entitlement-unavailable" ] || [ "$event_count" -ne 0 ] || [ "$pages" -ne 0 ] || [ "$coverage" != "n/a" ] || [ "$matchup_count" -ne 0 ]; then
+                    metadata_ok=false
+                    echo "::warning::${label} unexpected unavailable state on attempt ${attempt}."
+                  else
+                    echo "${label} recognized provider entitlement unavailability; accepting healthy unavailable board."
+                  fi
+                else
+                  if [ "$coverage" != "yes" ]; then
+                    metadata_ok=false
+                    echo "::warning::${label} incomplete coverage on attempt ${attempt}."
+                  elif [ "$event_count" -ne "$matchup_count" ]; then
+                    metadata_ok=false
+                    echo "::warning::${label} event/matchup mismatch on attempt ${attempt}."
+                  fi
+                fi
+
+                if [ "$metadata_ok" = "true" ]; then
+                  {
+                    printf '<!doctype html>\n<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0"><title>GameMode %s Odds Board</title></head><body>\n' "$label"
+                    printf '<h1>GameMode %s Odds Board</h1>\n<p>Compact read-only market snapshot.</p>\n<p>Generated: %s</p>\n<pre>\n' "$label" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+                    grep -E '<strong>Updated:</strong>|<strong>Board State:</strong>|<strong>Event Count:</strong>|<strong>Coverage Complete:</strong>|<strong>Pages Fetched:</strong>|<strong>Window Hours:</strong>|<strong>Source Mode:</strong>|<strong>Provider Status:</strong>|<h2>|<strong>Start:</strong>|"marketName"|"odds"|"bookOdds"|"fairOdds"|"spread"|"overUnder"|"available"|"deeplink"|"fanduel"' full-board.html || true
+                    printf '</pre></body></html>\n'
+                  } > "${file}.new"
+                  mv "${file}.new" "$file"
+                  success=true
+                  echo "RECOVERED ${label}: accepted on attempt ${attempt}."
+                  break
+                fi
+              else
+                echo "::warning::${label} board request failed with HTTP ${http_code} on attempt ${attempt}."
+              fi
+
+              if [ "$attempt" -lt 4 ]; then
+                case "$attempt" in
+                  1) delay=15 ;;
+                  2) delay=30 ;;
+                  *) delay=60 ;;
+                esac
+                echo "Retrying ${label} after ${delay}s cooldown."
+                sleep "$delay"
+              fi
+            done
+
+            rm -f full-board.html "${file}.new"
+
+            if [ "$success" != "true" ]; then
+              echo "$league" >> .refresh-failed
+              echo "::error::${label} did not produce an acceptable board after recovery attempts; preserving previous ${file}."
               return 0
             fi
-
-            updated="$(sed -n 's/.*<strong>Updated:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
-            board_state="$(sed -n 's/.*<strong>Board State:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
-            event_count="$(sed -n 's/.*<strong>Event Count:<\/strong>[[:space:]]*\([0-9][0-9]*\).*/\1/p' full-board.html | head -n1)"
-            coverage="$(sed -n 's/.*<strong>Coverage Complete:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
-            pages="$(sed -n 's/.*<strong>Pages Fetched:<\/strong>[[:space:]]*\([0-9][0-9]*\).*/\1/p' full-board.html | head -n1)"
-            window="$(sed -n 's/.*<strong>Window Hours:<\/strong>[[:space:]]*\([0-9][0-9]*\).*/\1/p' full-board.html | head -n1)"
-            source_mode="$(sed -n 's/.*<strong>Source Mode:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
-            matchup_count="$(grep -c '<h2>' full-board.html || true)"
-
-            echo "ACCEPTANCE ${label}: updated=${updated:-missing} state=${board_state:-missing} events=${event_count:-missing} matchups=${matchup_count:-0} coverage=${coverage:-missing} pages=${pages:-missing} windowHours=${window:-missing} sourceMode=${source_mode:-missing}"
-
-            if [ -z "$updated" ] || ! [[ "$event_count" =~ ^[0-9]+$ ]] || ! [[ "$pages" =~ ^[0-9]+$ ]] || ! [[ "$window" =~ ^[0-9]+$ ]] || [ -z "$board_state" ] || [ -z "$source_mode" ]; then
-              echo "::warning::${label} malformed metadata; preserving previous ${file}"
-              touch .refresh-failed
-              rm -f full-board.html "${file}.new"
-              return 0
-            fi
-
-            if [ "$board_state" = "unavailable" ]; then
-              if [ "$source_mode" != "provider-entitlement-unavailable" ] || [ "$event_count" -ne 0 ] || [ "$pages" -ne 0 ] || [ "$coverage" != "n/a" ] || [ "$matchup_count" -ne 0 ]; then
-                echo "::warning::${label} unexpected unavailable state; preserving previous ${file}"
-                touch .refresh-failed
-                rm -f full-board.html "${file}.new"
-                return 0
-              fi
-              echo "${label} recognized provider entitlement unavailability; accepting healthy unavailable board."
-            else
-              if [ "$coverage" != "yes" ]; then
-                echo "::warning::${label} incomplete coverage; preserving previous ${file}"
-                touch .refresh-failed
-                rm -f full-board.html "${file}.new"
-                return 0
-              fi
-              if [ "$event_count" -ne "$matchup_count" ]; then
-                echo "::warning::${label} event/matchup mismatch; preserving previous ${file}"
-                touch .refresh-failed
-                rm -f full-board.html "${file}.new"
-                return 0
-              fi
-            fi
-
-            {
-              printf '<!doctype html>\n<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0"><title>GameMode %s Odds Board</title></head><body>\n' "$label"
-              printf '<h1>GameMode %s Odds Board</h1>\n<p>Compact read-only market snapshot.</p>\n<p>Generated: %s</p>\n<pre>\n' "$label" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-              grep -E '<strong>Updated:</strong>|<strong>Board State:</strong>|<strong>Event Count:</strong>|<strong>Coverage Complete:</strong>|<strong>Pages Fetched:</strong>|<strong>Window Hours:</strong>|<strong>Source Mode:</strong>|<strong>Provider Status:</strong>|<h2>|<strong>Start:</strong>|"marketName"|"odds"|"bookOdds"|"fairOdds"|"spread"|"overUnder"|"available"|"deeplink"|"fanduel"' full-board.html || true
-              printf '</pre></body></html>\n'
-            } > "${file}.new"
-
-            mv "${file}.new" "$file"
-            rm -f full-board.html
           }
 
           fetch_board MLB mlb.html MLB
+          sleep 8
           fetch_board NFL nfl.html NFL
+          sleep 8
           fetch_board NBA nba.html NBA
+          sleep 8
           fetch_board WNBA wnba.html WNBA
+          sleep 8
           fetch_board NCAAF ncaaf.html "College Football"
+          sleep 8
           fetch_board NCAAB ncaab.html "College Basketball"
 
-      - name: Build index page
+      - name: Capture WNBA diagnostics only if refresh failed
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
+          if [ -f .refresh-failed ] && grep -qx 'WNBA' .refresh-failed; then
+            curl -fsSL --connect-timeout 20 --max-time 120 \
+              "https://gamemode-80wa.onrender.com/diagnostics/board?leagueID=WNBA&windowHours=36" \
+              || echo "::warning::WNBA diagnostic endpoint unavailable"
+          else
+            echo "WNBA did not fail; skipping extra provider diagnostic traffic."
+          fi
+
+      - name: Record complete refresh and build index
+        if: steps.refresh_gate.outputs.run_refresh == 'true'
+        shell: bash
+        run: |
+          attempt_time="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          if [ ! -f .refresh-failed ]; then
+            printf '%s\n' "$attempt_time" > last-successful-refresh.txt
+            refresh_state="COMPLETE"
+          else
+            refresh_state="PARTIAL/FAILED"
+          fi
+
+          last_success="never"
+          if [ -f last-successful-refresh.txt ]; then
+            last_success="$(head -n1 last-successful-refresh.txt | tr -d '\r\n')"
+          fi
+
           version="$(date -u +%Y%m%d%H%M%S)"
           cat > index.html <<EOF
           <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0"><title>GameMode Sports Odds Board</title></head><body>
-          <h1>GameMode Sports Odds Board</h1><p>Public read-only compact market snapshots.</p><p>Index generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')</p><ul>
+          <h1>GameMode Sports Odds Board</h1><p>Public read-only compact market snapshots.</p>
+          <p>Last refresh attempt: ${attempt_time}</p><p>Attempt state: ${refresh_state}</p><p>Last complete six-league refresh: ${last_success}</p><p>Per-league Updated timestamps are authoritative for league freshness.</p><ul>
           <li><a href="mlb.html?v=${version}">MLB</a></li><li><a href="nfl.html?v=${version}">NFL</a></li><li><a href="nba.html?v=${version}">NBA</a></li><li><a href="wnba.html?v=${version}">WNBA</a></li><li><a href="ncaaf.html?v=${version}">College Football</a></li><li><a href="ncaab.html?v=${version}">College Basketball</a></li>
           </ul></body></html>
           EOF
@@ -170,6 +217,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add index.html mlb.html nfl.html nba.html wnba.html ncaaf.html ncaab.html
+          if [ -f last-successful-refresh.txt ]; then
+            git add last-successful-refresh.txt
+          fi
           if ! git diff --cached --quiet; then
             git commit -m "Update compact odds boards"
             git pull --rebase origin main
@@ -183,13 +233,15 @@ jobs:
         shell: bash
         run: |
           if [ -f .refresh-failed ]; then
-            echo "One or more league refreshes genuinely failed or were incomplete. Successful leagues were published and prior valid failed-league boards were preserved."
+            echo "Failed leagues after recovery attempts:"
+            cat .refresh-failed
+            echo "One or more league refreshes genuinely failed or were incomplete. Successful leagues were published; previous valid failed-league boards were preserved; the complete-refresh marker was NOT advanced."
             exit 1
           fi
-          echo "All league refreshes completed with valid complete board metadata."
+          echo "All league refreshes completed with valid complete board metadata. Complete-refresh marker advanced."
 
       - name: Guarded fallback skipped
         if: steps.refresh_gate.outputs.run_refresh != 'true'
         shell: bash
         run: |
-          echo "Fallback schedule fired, but a recent successful board publication already exists. No duplicate refresh needed."
+          echo "Fallback schedule fired, but a recent COMPLETE six-league refresh already exists. No duplicate refresh needed."
