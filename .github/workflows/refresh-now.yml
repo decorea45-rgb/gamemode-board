@@ -1,0 +1,23 @@
+name: GameMode refresh now
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/refresh-now.yml"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch-refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger current board refresh workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run update-board.yml --repo "${{ github.repository }}" --ref main
+          echo "Requested a fresh Update odds boards workflow_dispatch run on main."
