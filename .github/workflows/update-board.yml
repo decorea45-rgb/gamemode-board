@@ -22,6 +22,10 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Scheduled runs can sit queued behind the concurrency group. Check out
+          # the live branch at execution time instead of the stale trigger SHA.
+          ref: main
 
       - name: Decide whether fallback refresh is needed
         id: refresh_gate
