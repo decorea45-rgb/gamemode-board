@@ -25,27 +25,47 @@ jobs:
         with:
           ref: main
 
-      - name: Decide whether fallback refresh is needed
+      - name: Decide whether refresh is needed
         id: refresh_gate
         shell: bash
         run: |
           run_refresh=true
+          skip_reason=""
           trigger_schedule="${{ github.event.schedule }}"
+          now_epoch="$(date -u +%s)"
           echo "Trigger event=${{ github.event_name }} schedule=${trigger_schedule:-n/a}"
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "$trigger_schedule" = "27,57 * * * *" ] && [ -f last-successful-refresh.txt ]; then
+
+          # Persist provider cooldown across workflow runs so the fallback schedule does
+          # not immediately re-hit an upstream provider that already asked us to wait.
+          if [ -f provider-cooldown-until.txt ]; then
+            cooldown_until="$(head -n1 provider-cooldown-until.txt | tr -d '\r\n')"
+            cooldown_epoch="$(date -u -d "$cooldown_until" +%s 2>/dev/null || echo 0)"
+            if [ "$cooldown_epoch" -gt "$now_epoch" ]; then
+              remaining=$((cooldown_epoch - now_epoch))
+              run_refresh=false
+              skip_reason="provider-cooldown"
+              echo "Persisted provider cooldown active until ${cooldown_until} (${remaining}s remaining); no upstream board calls will be made."
+            else
+              echo "Persisted provider cooldown expired at ${cooldown_until}; refresh may probe recovery."
+            fi
+          fi
+
+          if [ "$run_refresh" = "true" ] && [ "${{ github.event_name }}" = "schedule" ] && [ "$trigger_schedule" = "27,57 * * * *" ] && [ -f last-successful-refresh.txt ]; then
             last_success="$(head -n1 last-successful-refresh.txt | tr -d '\r\n')"
             last_epoch="$(date -u -d "$last_success" +%s 2>/dev/null || echo 0)"
-            now_epoch="$(date -u +%s)"
             age_seconds=$((now_epoch - last_epoch))
             echo "Fallback complete-refresh check: last_success=${last_success:-missing} age_seconds=${age_seconds}"
             if [ "$last_epoch" -gt 0 ] && [ "$age_seconds" -ge 0 ] && [ "$age_seconds" -lt 1200 ]; then
               run_refresh=false
+              skip_reason="recent-complete-refresh"
               echo "Recent complete six-league refresh exists; fallback exits cleanly."
             fi
           fi
           echo "run_refresh=$run_refresh" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=${skip_reason:-none}" >> "$GITHUB_OUTPUT"
 
       - name: Verify deployed GameMode backend and provider gate
+        id: backend_gate
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
@@ -58,7 +78,17 @@ jobs:
             echo "BACKEND PREFLIGHT attempt=${attempt} expected=${expected} observed=${version:-unavailable} circuit=${circuit:-unknown} retry=${retry:-0}s"
             if [ "$version" = "$expected" ]; then
               echo "Deployed GameMode backend ${expected} confirmed."
-              sleep 5
+              if [ "$circuit" = "true" ] && [[ "$retry" =~ ^[0-9]+$ ]] && [ "$retry" -gt 0 ]; then
+                now_epoch="$(date -u +%s)"
+                # Add a one-minute safety buffer so a fallback run does not probe on
+                # the exact second the backend circuit expires.
+                until_epoch=$((now_epoch + retry + 60))
+                date -u -d "@${until_epoch}" +'%Y-%m-%dT%H:%M:%SZ' > provider-cooldown-until.txt
+                echo "provider_ready=false" >> "$GITHUB_OUTPUT"
+                echo "Backend provider circuit is already open; persisted cooldown and skipped board calls."
+              else
+                echo "provider_ready=true" >> "$GITHUB_OUTPUT"
+              fi
               exit 0
             fi
             sleep 15
@@ -67,7 +97,7 @@ jobs:
           exit 1
 
       - name: Fetch compact framework odds boards with circuit-aware recovery
-        if: steps.refresh_gate.outputs.run_refresh == 'true'
+        if: steps.refresh_gate.outputs.run_refresh == 'true' && steps.backend_gate.outputs.provider_ready == 'true'
         shell: bash
         run: |
           rm -f .refresh-failed .refresh-attempts .refresh-success .provider-degraded
@@ -77,6 +107,17 @@ jobs:
             league="$1"; file="$2"; label="$3"
             grep -qx "$league" .refresh-failed 2>/dev/null || echo "$league" >> .refresh-failed
             echo "::error::${label} refresh unavailable; preserving previous ${file}."
+          }
+
+          persist_provider_cooldown () {
+            retry="$1"
+            if ! [[ "$retry" =~ ^[0-9]+$ ]] || [ "$retry" -le 0 ]; then retry=900; fi
+            [ "$retry" -lt 300 ] && retry=300
+            [ "$retry" -gt 3600 ] && retry=3600
+            now_epoch="$(date -u +%s)"
+            until_epoch=$((now_epoch + retry + 60))
+            date -u -d "@${until_epoch}" +'%Y-%m-%dT%H:%M:%SZ' > provider-cooldown-until.txt
+            echo "Persisted provider cooldown until $(cat provider-cooldown-until.txt)."
           }
 
           fetch_board () {
@@ -133,6 +174,7 @@ jobs:
               if [ "$provider_state" = "cooldown" ] || [ "$http_code" = "429" ]; then
                 provider_stop=true
                 touch .provider-degraded
+                persist_provider_cooldown "$retry_after"
                 echo "Provider circuit confirmed degraded by ${label}; suppressing remaining upstream calls this run."
                 break
               fi
@@ -156,8 +198,15 @@ jobs:
           fetch_board NCAAF ncaaf.html "College Football"; space_if_open
           fetch_board NCAAB ncaab.html "College Basketball"
 
+      - name: Record backend-open provider cooldown
+        if: steps.refresh_gate.outputs.run_refresh == 'true' && steps.backend_gate.outputs.provider_ready == 'false'
+        shell: bash
+        run: |
+          touch .provider-degraded
+          echo "Backend reported an already-open provider circuit; board fetches were skipped."
+
       - name: Capture WNBA diagnostics only when useful
-        if: steps.refresh_gate.outputs.run_refresh == 'true'
+        if: steps.refresh_gate.outputs.run_refresh == 'true' && steps.backend_gate.outputs.provider_ready == 'true'
         shell: bash
         run: |
           if [ -f .provider-degraded ]; then
@@ -172,8 +221,9 @@ jobs:
         run: |
           attempt_time="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           if [ -f .refresh-success ]; then success_count="$(wc -l < .refresh-success)"; else success_count=0; fi
-          if [ ! -f .refresh-failed ]; then
+          if [ ! -f .refresh-failed ] && [ ! -f .provider-degraded ]; then
             printf '%s\n' "$attempt_time" > last-successful-refresh.txt
+            rm -f provider-cooldown-until.txt
             refresh_state="COMPLETE"
           else
             refresh_state="PARTIAL/FAILED"
@@ -193,7 +243,7 @@ jobs:
           </ul></body></html>
           EOF
 
-      - name: Publish updated boards
+      - name: Publish updated boards and provider state
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
@@ -201,8 +251,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add index.html mlb.html nfl.html nba.html wnba.html ncaaf.html ncaab.html
           if [ -f last-successful-refresh.txt ]; then git add last-successful-refresh.txt; fi
+          if [ -f provider-cooldown-until.txt ]; then git add provider-cooldown-until.txt; else git rm --cached --ignore-unmatch provider-cooldown-until.txt >/dev/null 2>&1 || true; fi
           if ! git diff --cached --quiet; then
-            git commit -m "Update compact odds boards"
+            git commit -m "Update compact odds boards and provider state"
             git pull --rebase origin main
             git push
           else
@@ -213,6 +264,10 @@ jobs:
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
+          if [ -f .provider-degraded ] && [ ! -f .refresh-failed ]; then
+            echo "Provider circuit was already open before board fetches; no stale board was replaced and complete-refresh marker was not advanced."
+            exit 0
+          fi
           if [ -f .refresh-failed ]; then
             echo "Failed leagues after recovery attempts:"
             cat .refresh-failed
@@ -222,8 +277,13 @@ jobs:
           fi
           echo "All six league refreshes completed with valid metadata. Complete-refresh marker advanced."
 
-      - name: Guarded fallback skipped
+      - name: Refresh skipped safely
         if: steps.refresh_gate.outputs.run_refresh != 'true'
         shell: bash
         run: |
-          echo "Fallback schedule fired, but a recent COMPLETE six-league refresh already exists."
+          reason="${{ steps.refresh_gate.outputs.skip_reason }}"
+          if [ "$reason" = "provider-cooldown" ]; then
+            echo "Refresh skipped cleanly because persisted provider cooldown is still active; no upstream requests were made."
+          else
+            echo "Fallback schedule fired, but a recent COMPLETE six-league refresh already exists."
+          fi
