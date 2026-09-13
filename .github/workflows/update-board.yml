@@ -16,12 +16,12 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
     concurrency:
       group: gamemode-board-refresh
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: main
 
@@ -154,41 +154,46 @@ jobs:
                 fi
               fi
 
+              # A cooldown response from backend 1.5.3 already follows its own
+              # provider retry. Treat it as confirmed provider-wide degradation;
+              # do not add another workflow-level wait/retry or hit five more leagues.
+              if [ "$provider_state" = "cooldown" ] || [ "$http_code" = "429" ]; then
+                provider_stop=true
+                touch .provider-degraded
+                echo "Provider circuit confirmed degraded by ${label}; suppressing remaining upstream calls this run."
+                break
+              fi
+
               if [ "$attempt" -lt 2 ]; then
                 if [[ "$retry_after" =~ ^[0-9]+$ ]] && [ "$retry_after" -gt 0 ]; then
                   delay="$retry_after"
                   [ "$delay" -lt 30 ] && delay=30
-                  [ "$delay" -gt 300 ] && delay=300
-                elif [ "$http_code" = "429" ] || [ "$http_code" = "503" ]; then
-                  delay=120
+                  [ "$delay" -gt 180 ] && delay=180
+                elif [ "$http_code" = "503" ]; then
+                  delay=60
                 else
-                  delay=45
+                  delay=30
                 fi
-                echo "Cooldown for ${label}: ${delay}s before final attempt."
+                echo "Non-circuit cooldown for ${label}: ${delay}s before final attempt."
                 sleep "$delay"
-              elif [ "$provider_state" = "cooldown" ] || [ "$http_code" = "429" ]; then
-                provider_stop=true
-                touch .provider-degraded
-                echo "Provider circuit confirmed degraded after final ${label} attempt; suppressing remaining upstream calls this run."
               fi
             done
 
             rm -f full-board.html "${file}.new" response-headers.txt
-            if [ "$success" != "true" ]; then
-              mark_failed "$league" "$file" "$label"
-            fi
+            if [ "$success" != "true" ]; then mark_failed "$league" "$file" "$label"; fi
           }
 
+          space_if_open () { if [ "$provider_stop" != "true" ]; then sleep 10; fi; }
           fetch_board MLB mlb.html MLB
-          sleep 10
+          space_if_open
           fetch_board NFL nfl.html NFL
-          sleep 10
+          space_if_open
           fetch_board NBA nba.html NBA
-          sleep 10
+          space_if_open
           fetch_board WNBA wnba.html WNBA
-          sleep 10
+          space_if_open
           fetch_board NCAAF ncaaf.html "College Football"
-          sleep 10
+          space_if_open
           fetch_board NCAAB ncaab.html "College Basketball"
 
       - name: Capture WNBA diagnostics only when useful
@@ -210,7 +215,7 @@ jobs:
         shell: bash
         run: |
           attempt_time="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          success_count="$(wc -l < .refresh-success 2>/dev/null || echo 0)"
+          if [ -f .refresh-success ]; then success_count="$(wc -l < .refresh-success)"; else success_count=0; fi
           if [ ! -f .refresh-failed ]; then
             printf '%s\n' "$attempt_time" > last-successful-refresh.txt
             refresh_state="COMPLETE"
@@ -219,11 +224,9 @@ jobs:
           fi
 
           last_success="never"
-          if [ -f last-successful-refresh.txt ]; then
-            last_success="$(head -n1 last-successful-refresh.txt | tr -d '\r\n')"
-          fi
+          if [ -f last-successful-refresh.txt ]; then last_success="$(head -n1 last-successful-refresh.txt | tr -d '\r\n')"; fi
 
-          # Do not churn the public index when absolutely no league refreshed.
+          # Zero-success provider failures preserve the public index as well as boards.
           if [ "$success_count" -eq 0 ] && [ "$refresh_state" != "COMPLETE" ]; then
             echo "No league refreshed successfully; preserving public index and all prior boards."
             exit 0
@@ -261,7 +264,7 @@ jobs:
           if [ -f .refresh-failed ]; then
             echo "Failed leagues after recovery attempts:"
             cat .refresh-failed
-            if [ -f .provider-degraded ]; then echo "Provider circuit was confirmed degraded; remaining calls were suppressed to protect recovery."; fi
+            if [ -f .provider-degraded ]; then echo "Provider circuit confirmed degraded; remaining calls were suppressed to protect recovery."; fi
             echo "Complete-refresh marker was NOT advanced; previous valid failed-league boards remain authoritative."
             exit 1
           fi
