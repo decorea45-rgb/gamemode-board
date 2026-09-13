@@ -32,21 +32,15 @@ jobs:
           run_refresh=true
           trigger_schedule="${{ github.event.schedule }}"
           echo "Trigger event=${{ github.event_name }} schedule=${trigger_schedule:-n/a}"
-
-          # Only a COMPLETE six-league marker may suppress the guarded fallback.
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "$trigger_schedule" = "27,57 * * * *" ]; then
-            if [ -f last-successful-refresh.txt ]; then
-              last_success="$(head -n1 last-successful-refresh.txt | tr -d '\r\n')"
-              last_epoch="$(date -u -d "$last_success" +%s 2>/dev/null || echo 0)"
-              now_epoch="$(date -u +%s)"
-              age_seconds=$((now_epoch - last_epoch))
-              echo "Fallback complete-refresh check: last_success=${last_success:-missing} age_seconds=${age_seconds}"
-              if [ "$last_epoch" -gt 0 ] && [ "$age_seconds" -ge 0 ] && [ "$age_seconds" -lt 1200 ]; then
-                run_refresh=false
-                echo "Recent complete six-league refresh exists; fallback exits cleanly."
-              fi
-            else
-              echo "No complete-refresh marker exists; fallback will run."
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$trigger_schedule" = "27,57 * * * *" ] && [ -f last-successful-refresh.txt ]; then
+            last_success="$(head -n1 last-successful-refresh.txt | tr -d '\r\n')"
+            last_epoch="$(date -u -d "$last_success" +%s 2>/dev/null || echo 0)"
+            now_epoch="$(date -u +%s)"
+            age_seconds=$((now_epoch - last_epoch))
+            echo "Fallback complete-refresh check: last_success=${last_success:-missing} age_seconds=${age_seconds}"
+            if [ "$last_epoch" -gt 0 ] && [ "$age_seconds" -ge 0 ] && [ "$age_seconds" -lt 1200 ]; then
+              run_refresh=false
+              echo "Recent complete six-league refresh exists; fallback exits cleanly."
             fi
           fi
           echo "run_refresh=$run_refresh" >> "$GITHUB_OUTPUT"
@@ -55,7 +49,7 @@ jobs:
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
-          expected="1.5.4"
+          expected="1.5.5"
           for attempt in $(seq 1 16); do
             health="$(curl -fsSL --connect-timeout 15 --max-time 30 https://gamemode-80wa.onrender.com/health || true)"
             version="$(printf '%s' "$health" | sed -n 's/.*"boardVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
@@ -63,7 +57,7 @@ jobs:
             retry="$(printf '%s' "$health" | sed -n 's/.*"providerRetryAfterSeconds"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
             echo "BACKEND PREFLIGHT attempt=${attempt} expected=${expected} observed=${version:-unavailable} circuit=${circuit:-unknown} retry=${retry:-0}s"
             if [ "$version" = "$expected" ]; then
-              echo "Deployed GameMode backend ${expected} confirmed. Provider state will be handled fail-fast by /board."
+              echo "Deployed GameMode backend ${expected} confirmed."
               sleep 5
               exit 0
             fi
@@ -80,18 +74,13 @@ jobs:
           provider_stop=false
 
           mark_failed () {
-            league="$1"
-            file="$2"
-            label="$3"
+            league="$1"; file="$2"; label="$3"
             grep -qx "$league" .refresh-failed 2>/dev/null || echo "$league" >> .refresh-failed
             echo "::error::${label} refresh unavailable; preserving previous ${file}."
           }
 
           fetch_board () {
-            league="$1"
-            file="$2"
-            label="$3"
-
+            league="$1"; file="$2"; label="$3"
             if [ "$provider_stop" = "true" ]; then
               mark_failed "$league" "$file" "$label"
               echo "Skipping ${label}: provider circuit already confirmed degraded in this run."
@@ -101,9 +90,7 @@ jobs:
             success=false
             for attempt in 1 2; do
               rm -f full-board.html "${file}.new" response-headers.txt
-              http_code="$(curl -sS -L --connect-timeout 20 --max-time 90 \
-                -D response-headers.txt -o full-board.html -w '%{http_code}' \
-                "https://gamemode-80wa.onrender.com/board?leagueID=${league}&windowHours=36" || true)"
+              http_code="$(curl -sS -L --connect-timeout 20 --max-time 90 -D response-headers.txt -o full-board.html -w '%{http_code}' "https://gamemode-80wa.onrender.com/board?leagueID=${league}&windowHours=36" || true)"
               [ -n "$http_code" ] || http_code="000"
               provider_state="$(awk 'BEGIN{IGNORECASE=1} /^x-gamemode-provider-state:/ {gsub("\r",""); print $2}' response-headers.txt | tail -n1)"
               retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {gsub("\r",""); print $2}' response-headers.txt | tail -n1)"
@@ -119,15 +106,11 @@ jobs:
                 window="$(sed -n 's/.*<strong>Window Hours:<\/strong>[[:space:]]*\([0-9][0-9]*\).*/\1/p' full-board.html | head -n1)"
                 source_mode="$(sed -n 's/.*<strong>Source Mode:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
                 matchup_count="$(grep -c '<h2>' full-board.html || true)"
-                echo "ACCEPTANCE ${label}: updated=${updated:-missing} state=${board_state:-missing} events=${event_count:-missing} matchups=${matchup_count:-0} coverage=${coverage:-missing} pages=${pages:-missing} windowHours=${window:-missing} sourceMode=${source_mode:-missing}"
-
                 metadata_ok=true
                 if [ -z "$updated" ] || ! [[ "$event_count" =~ ^[0-9]+$ ]] || ! [[ "$pages" =~ ^[0-9]+$ ]] || ! [[ "$window" =~ ^[0-9]+$ ]] || [ -z "$board_state" ] || [ -z "$source_mode" ]; then
                   metadata_ok=false
                 elif [ "$board_state" = "unavailable" ]; then
-                  if [ "$source_mode" != "provider-entitlement-unavailable" ] || [ "$event_count" -ne 0 ] || [ "$pages" -ne 0 ] || [ "$coverage" != "n/a" ] || [ "$matchup_count" -ne 0 ]; then
-                    metadata_ok=false
-                  fi
+                  if [ "$source_mode" != "provider-entitlement-unavailable" ] || [ "$event_count" -ne 0 ] || [ "$pages" -ne 0 ] || [ "$coverage" != "n/a" ] || [ "$matchup_count" -ne 0 ]; then metadata_ok=false; fi
                 elif [ "$coverage" != "yes" ] || [ "$event_count" -ne "$matchup_count" ]; then
                   metadata_ok=false
                 fi
@@ -147,9 +130,6 @@ jobs:
                 fi
               fi
 
-              # Backend 1.5.4 opens its provider circuit and returns immediately.
-              # A cooldown response therefore confirms provider-wide degradation;
-              # do not wait/retry at workflow level or hit five more leagues.
               if [ "$provider_state" = "cooldown" ] || [ "$http_code" = "429" ]; then
                 provider_stop=true
                 touch .provider-degraded
@@ -158,35 +138,22 @@ jobs:
               fi
 
               if [ "$attempt" -lt 2 ]; then
-                if [[ "$retry_after" =~ ^[0-9]+$ ]] && [ "$retry_after" -gt 0 ]; then
-                  delay="$retry_after"
-                  [ "$delay" -lt 30 ] && delay=30
-                  [ "$delay" -gt 180 ] && delay=180
-                elif [ "$http_code" = "503" ]; then
-                  delay=60
-                else
-                  delay=30
-                fi
-                echo "Non-circuit cooldown for ${label}: ${delay}s before final attempt."
+                if [[ "$retry_after" =~ ^[0-9]+$ ]] && [ "$retry_after" -gt 0 ]; then delay="$retry_after"; [ "$delay" -lt 30 ] && delay=30; [ "$delay" -gt 180 ] && delay=180;
+                elif [ "$http_code" = "503" ]; then delay=60;
+                else delay=30; fi
                 sleep "$delay"
               fi
             done
-
             rm -f full-board.html "${file}.new" response-headers.txt
             if [ "$success" != "true" ]; then mark_failed "$league" "$file" "$label"; fi
           }
 
           space_if_open () { if [ "$provider_stop" != "true" ]; then sleep 10; fi; }
-          fetch_board MLB mlb.html MLB
-          space_if_open
-          fetch_board NFL nfl.html NFL
-          space_if_open
-          fetch_board NBA nba.html NBA
-          space_if_open
-          fetch_board WNBA wnba.html WNBA
-          space_if_open
-          fetch_board NCAAF ncaaf.html "College Football"
-          space_if_open
+          fetch_board MLB mlb.html MLB; space_if_open
+          fetch_board NFL nfl.html NFL; space_if_open
+          fetch_board NBA nba.html NBA; space_if_open
+          fetch_board WNBA wnba.html WNBA; space_if_open
+          fetch_board NCAAF ncaaf.html "College Football"; space_if_open
           fetch_board NCAAB ncaab.html "College Basketball"
 
       - name: Capture WNBA diagnostics only when useful
@@ -196,11 +163,7 @@ jobs:
           if [ -f .provider-degraded ]; then
             echo "Provider circuit already confirmed degraded; no WNBA diagnostic traffic added."
           elif [ -f .refresh-failed ] && grep -qx 'WNBA' .refresh-failed; then
-            curl -fsSL --connect-timeout 20 --max-time 120 \
-              "https://gamemode-80wa.onrender.com/diagnostics/board?leagueID=WNBA&windowHours=36" \
-              || echo "::warning::WNBA diagnostic endpoint unavailable"
-          else
-            echo "WNBA did not require diagnostics."
+            curl -fsSL --connect-timeout 20 --max-time 120 "https://gamemode-80wa.onrender.com/diagnostics/board?leagueID=WNBA&windowHours=36" || echo "::warning::WNBA diagnostic endpoint unavailable"
           fi
 
       - name: Record refresh state and build index
@@ -215,21 +178,17 @@ jobs:
           else
             refresh_state="PARTIAL/FAILED"
           fi
-
           last_success="never"
           if [ -f last-successful-refresh.txt ]; then last_success="$(head -n1 last-successful-refresh.txt | tr -d '\r\n')"; fi
-
-          # Zero-success provider failures preserve the public index as well as boards.
           if [ "$success_count" -eq 0 ] && [ "$refresh_state" != "COMPLETE" ]; then
             echo "No league refreshed successfully; preserving public index and all prior boards."
             exit 0
           fi
-
           version="$(date -u +%Y%m%d%H%M%S)"
           cat > index.html <<EOF
-          <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0"><title>GameMode Sports Odds Board</title></head><body>
+          <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>GameMode Sports Odds Board</title></head><body>
           <h1>GameMode Sports Odds Board</h1><p>Public read-only compact market snapshots.</p>
-          <p>Last refresh attempt: ${attempt_time}</p><p>Attempt state: ${refresh_state}</p><p>Last complete six-league refresh: ${last_success}</p><p>Per-league Updated timestamps are authoritative for league freshness.</p><ul>
+          <p>Last refresh attempt: ${attempt_time}</p><p>Attempt state: ${refresh_state}</p><p>Last complete six-league refresh: ${last_success}</p><ul>
           <li><a href="mlb.html?v=${version}">MLB</a></li><li><a href="nfl.html?v=${version}">NFL</a></li><li><a href="nba.html?v=${version}">NBA</a></li><li><a href="wnba.html?v=${version}">WNBA</a></li><li><a href="ncaaf.html?v=${version}">College Football</a></li><li><a href="ncaab.html?v=${version}">College Basketball</a></li>
           </ul></body></html>
           EOF
