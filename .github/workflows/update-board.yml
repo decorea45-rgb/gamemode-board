@@ -266,7 +266,7 @@ jobs:
         run: |
           if [ -f .provider-degraded ] && [ ! -f .refresh-failed ]; then
             echo "Provider circuit was already open before board fetches; no stale board was replaced and complete-refresh marker was not advanced."
-            exit 0
+            exit 1
           fi
           if [ -f .refresh-failed ]; then
             echo "Failed leagues after recovery attempts:"
