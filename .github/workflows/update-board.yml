@@ -55,28 +55,21 @@ jobs:
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
-          expected="1.5.3"
-          for attempt in $(seq 1 20); do
+          expected="1.5.4"
+          for attempt in $(seq 1 16); do
             health="$(curl -fsSL --connect-timeout 15 --max-time 30 https://gamemode-80wa.onrender.com/health || true)"
             version="$(printf '%s' "$health" | sed -n 's/.*"boardVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
             circuit="$(printf '%s' "$health" | sed -n 's/.*"providerCircuitOpen"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p')"
             retry="$(printf '%s' "$health" | sed -n 's/.*"providerRetryAfterSeconds"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
             echo "BACKEND PREFLIGHT attempt=${attempt} expected=${expected} observed=${version:-unavailable} circuit=${circuit:-unknown} retry=${retry:-0}s"
-            if [ "$version" = "$expected" ] && [ "${circuit:-false}" != "true" ]; then
-              echo "Deployed GameMode backend ${expected} confirmed; provider gate is open for traffic."
-              sleep 10
+            if [ "$version" = "$expected" ]; then
+              echo "Deployed GameMode backend ${expected} confirmed. Provider state will be handled fail-fast by /board."
+              sleep 5
               exit 0
             fi
-            if [ "$version" = "$expected" ] && [ "$circuit" = "true" ] && [[ "$retry" =~ ^[0-9]+$ ]] && [ "$retry" -gt 0 ]; then
-              delay="$retry"
-              [ "$delay" -gt 60 ] && delay=60
-              [ "$delay" -lt 10 ] && delay=10
-              sleep "$delay"
-            else
-              sleep 15
-            fi
+            sleep 15
           done
-          echo "::error::GameMode backend ${expected} or provider gate was not ready in time."
+          echo "::error::GameMode backend ${expected} was not observed in time."
           exit 1
 
       - name: Fetch compact framework odds boards with circuit-aware recovery
@@ -108,7 +101,7 @@ jobs:
             success=false
             for attempt in 1 2; do
               rm -f full-board.html "${file}.new" response-headers.txt
-              http_code="$(curl -sS -L --connect-timeout 20 --max-time 240 \
+              http_code="$(curl -sS -L --connect-timeout 20 --max-time 90 \
                 -D response-headers.txt -o full-board.html -w '%{http_code}' \
                 "https://gamemode-80wa.onrender.com/board?leagueID=${league}&windowHours=36" || true)"
               [ -n "$http_code" ] || http_code="000"
@@ -154,9 +147,9 @@ jobs:
                 fi
               fi
 
-              # A cooldown response from backend 1.5.3 already follows its own
-              # provider retry. Treat it as confirmed provider-wide degradation;
-              # do not add another workflow-level wait/retry or hit five more leagues.
+              # Backend 1.5.4 opens its provider circuit and returns immediately.
+              # A cooldown response therefore confirms provider-wide degradation;
+              # do not wait/retry at workflow level or hit five more leagues.
               if [ "$provider_state" = "cooldown" ] || [ "$http_code" = "429" ]; then
                 provider_stop=true
                 touch .provider-degraded
