@@ -1,0 +1,39 @@
+name: Sync board refresh to GameMode 1.5.5
+
+on:
+  push:
+    branches: [sync-gamemode-155]
+    paths:
+      - ".github/workflows/sync-155.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: sync-gamemode-155
+      - name: Update expected backend version
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('.github/workflows/update-board.yml')
+          s=p.read_text()
+          if 'expected="1.5.4"' not in s:
+              raise SystemExit('Expected 1.5.4 preflight marker not found')
+          s=s.replace('expected="1.5.4"','expected="1.5.5"')
+          p.write_text(s)
+          PY
+      - name: Commit sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/update-board.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "Sync board refresh to GameMode 1.5.5"
+            git push origin sync-gamemode-155
+          fi
