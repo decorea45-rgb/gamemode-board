@@ -16,7 +16,7 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 25
     concurrency:
       group: gamemode-board-refresh
       cancel-in-progress: false
@@ -33,8 +33,7 @@ jobs:
           trigger_schedule="${{ github.event.schedule }}"
           echo "Trigger event=${{ github.event_name }} schedule=${trigger_schedule:-n/a}"
 
-          # Fallback freshness is based ONLY on the last complete six-league refresh.
-          # A partial/failed run must never suppress recovery.
+          # Only a COMPLETE six-league marker may suppress the guarded fallback.
           if [ "${{ github.event_name }}" = "schedule" ] && [ "$trigger_schedule" = "27,57 * * * *" ]; then
             if [ -f last-successful-refresh.txt ]; then
               last_success="$(head -n1 last-successful-refresh.txt | tr -d '\r\n')"
@@ -44,60 +43,79 @@ jobs:
               echo "Fallback complete-refresh check: last_success=${last_success:-missing} age_seconds=${age_seconds}"
               if [ "$last_epoch" -gt 0 ] && [ "$age_seconds" -ge 0 ] && [ "$age_seconds" -lt 1200 ]; then
                 run_refresh=false
-                echo "A complete six-league refresh is recent; guarded fallback can exit cleanly."
+                echo "Recent complete six-league refresh exists; fallback exits cleanly."
               fi
             else
               echo "No complete-refresh marker exists; fallback will run."
             fi
           fi
-
           echo "run_refresh=$run_refresh" >> "$GITHUB_OUTPUT"
 
-      - name: Verify and warm deployed GameMode backend
+      - name: Verify deployed GameMode backend and provider gate
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
-          expected="1.5.2"
-          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+          expected="1.5.3"
+          for attempt in $(seq 1 20); do
             health="$(curl -fsSL --connect-timeout 15 --max-time 30 https://gamemode-80wa.onrender.com/health || true)"
             version="$(printf '%s' "$health" | sed -n 's/.*"boardVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-            echo "BACKEND PREFLIGHT attempt=${attempt} expected=${expected} observed=${version:-unavailable}"
-            if [ "$version" = "$expected" ]; then
-              echo "Deployed GameMode backend ${expected} confirmed and warm."
-              # Health can recover before the upstream provider's quota/rate bucket.
-              # Give provider traffic a real quiet period instead of immediately
-              # hammering six leagues after a wake-up.
-              sleep 30
+            circuit="$(printf '%s' "$health" | sed -n 's/.*"providerCircuitOpen"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p')"
+            retry="$(printf '%s' "$health" | sed -n 's/.*"providerRetryAfterSeconds"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+            echo "BACKEND PREFLIGHT attempt=${attempt} expected=${expected} observed=${version:-unavailable} circuit=${circuit:-unknown} retry=${retry:-0}s"
+            if [ "$version" = "$expected" ] && [ "${circuit:-false}" != "true" ]; then
+              echo "Deployed GameMode backend ${expected} confirmed; provider gate is open for traffic."
+              sleep 10
               exit 0
             fi
-            sleep 15
+            if [ "$version" = "$expected" ] && [ "$circuit" = "true" ] && [[ "$retry" =~ ^[0-9]+$ ]] && [ "$retry" -gt 0 ]; then
+              delay="$retry"
+              [ "$delay" -gt 60 ] && delay=60
+              [ "$delay" -lt 10 ] && delay=10
+              sleep "$delay"
+            else
+              sleep 15
+            fi
           done
-          echo "::error::GameMode backend ${expected} was not observed after preflight wait."
+          echo "::error::GameMode backend ${expected} or provider gate was not ready in time."
           exit 1
 
-      - name: Fetch compact framework odds boards with provider-aware recovery
+      - name: Fetch compact framework odds boards with circuit-aware recovery
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
-          rm -f .refresh-failed .refresh-attempts
+          rm -f .refresh-failed .refresh-attempts .refresh-success .provider-degraded
+          provider_stop=false
+
+          mark_failed () {
+            league="$1"
+            file="$2"
+            label="$3"
+            grep -qx "$league" .refresh-failed 2>/dev/null || echo "$league" >> .refresh-failed
+            echo "::error::${label} refresh unavailable; preserving previous ${file}."
+          }
 
           fetch_board () {
             league="$1"
             file="$2"
             label="$3"
-            success=false
 
-            # Two endpoint attempts are deliberate. The backend itself already performs
-            # provider-side discovery/recovery. Repeatedly calling /board on 429/503
-            # amplified provider throttling and made recovery less likely.
+            if [ "$provider_stop" = "true" ]; then
+              mark_failed "$league" "$file" "$label"
+              echo "Skipping ${label}: provider circuit already confirmed degraded in this run."
+              return 0
+            fi
+
+            success=false
             for attempt in 1 2; do
               rm -f full-board.html "${file}.new" response-headers.txt
               http_code="$(curl -sS -L --connect-timeout 20 --max-time 240 \
                 -D response-headers.txt -o full-board.html -w '%{http_code}' \
                 "https://gamemode-80wa.onrender.com/board?leagueID=${league}&windowHours=36" || true)"
               [ -n "$http_code" ] || http_code="000"
-              echo "${league}:${http_code}" >> .refresh-attempts
-              echo "FETCH ${label}: attempt=${attempt} http=${http_code}"
+              provider_state="$(awk 'BEGIN{IGNORECASE=1} /^x-gamemode-provider-state:/ {gsub("\r",""); print $2}' response-headers.txt | tail -n1)"
+              retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {gsub("\r",""); print $2}' response-headers.txt | tail -n1)"
+              echo "${league}:${http_code}:${provider_state:-n/a}:${retry_after:-0}" >> .refresh-attempts
+              echo "FETCH ${label}: attempt=${attempt} http=${http_code} provider=${provider_state:-n/a} retry=${retry_after:-0}s"
 
               if [ "$http_code" = "200" ] && [ -s full-board.html ]; then
                 updated="$(sed -n 's/.*<strong>Updated:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
@@ -108,28 +126,17 @@ jobs:
                 window="$(sed -n 's/.*<strong>Window Hours:<\/strong>[[:space:]]*\([0-9][0-9]*\).*/\1/p' full-board.html | head -n1)"
                 source_mode="$(sed -n 's/.*<strong>Source Mode:<\/strong>[[:space:]]*\([^<]*\).*/\1/p' full-board.html | head -n1)"
                 matchup_count="$(grep -c '<h2>' full-board.html || true)"
-
                 echo "ACCEPTANCE ${label}: updated=${updated:-missing} state=${board_state:-missing} events=${event_count:-missing} matchups=${matchup_count:-0} coverage=${coverage:-missing} pages=${pages:-missing} windowHours=${window:-missing} sourceMode=${source_mode:-missing}"
 
                 metadata_ok=true
                 if [ -z "$updated" ] || ! [[ "$event_count" =~ ^[0-9]+$ ]] || ! [[ "$pages" =~ ^[0-9]+$ ]] || ! [[ "$window" =~ ^[0-9]+$ ]] || [ -z "$board_state" ] || [ -z "$source_mode" ]; then
                   metadata_ok=false
-                  echo "::warning::${label} malformed metadata on attempt ${attempt}."
                 elif [ "$board_state" = "unavailable" ]; then
                   if [ "$source_mode" != "provider-entitlement-unavailable" ] || [ "$event_count" -ne 0 ] || [ "$pages" -ne 0 ] || [ "$coverage" != "n/a" ] || [ "$matchup_count" -ne 0 ]; then
                     metadata_ok=false
-                    echo "::warning::${label} unexpected unavailable state on attempt ${attempt}."
-                  else
-                    echo "${label} recognized provider entitlement unavailability; accepting healthy unavailable board."
                   fi
-                else
-                  if [ "$coverage" != "yes" ]; then
-                    metadata_ok=false
-                    echo "::warning::${label} incomplete coverage on attempt ${attempt}."
-                  elif [ "$event_count" -ne "$matchup_count" ]; then
-                    metadata_ok=false
-                    echo "::warning::${label} event/matchup mismatch on attempt ${attempt}."
-                  fi
+                elif [ "$coverage" != "yes" ] || [ "$event_count" -ne "$matchup_count" ]; then
+                  metadata_ok=false
                 fi
 
                 if [ "$metadata_ok" = "true" ]; then
@@ -140,77 +147,70 @@ jobs:
                     printf '</pre></body></html>\n'
                   } > "${file}.new"
                   mv "${file}.new" "$file"
+                  echo "$league" >> .refresh-success
                   success=true
                   echo "RECOVERED ${label}: accepted on attempt ${attempt}."
                   break
                 fi
-              else
-                echo "::warning::${label} board request failed with HTTP ${http_code} on attempt ${attempt}."
               fi
 
               if [ "$attempt" -lt 2 ]; then
-                retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {gsub("\r",""); print $2}' response-headers.txt | tail -n1)"
                 if [[ "$retry_after" =~ ^[0-9]+$ ]] && [ "$retry_after" -gt 0 ]; then
                   delay="$retry_after"
-                  [ "$delay" -lt 90 ] && delay=90
+                  [ "$delay" -lt 30 ] && delay=30
                   [ "$delay" -gt 300 ] && delay=300
                 elif [ "$http_code" = "429" ] || [ "$http_code" = "503" ]; then
                   delay=120
                 else
                   delay=45
                 fi
-                echo "Provider-aware cooldown for ${label}: ${delay}s before final attempt."
+                echo "Cooldown for ${label}: ${delay}s before final attempt."
                 sleep "$delay"
+              elif [ "$provider_state" = "cooldown" ] || [ "$http_code" = "429" ]; then
+                provider_stop=true
+                touch .provider-degraded
+                echo "Provider circuit confirmed degraded after final ${label} attempt; suppressing remaining upstream calls this run."
               fi
             done
 
             rm -f full-board.html "${file}.new" response-headers.txt
-
             if [ "$success" != "true" ]; then
-              echo "$league" >> .refresh-failed
-              echo "::error::${label} did not produce an acceptable board after provider-aware recovery; preserving previous ${file}."
-              return 0
+              mark_failed "$league" "$file" "$label"
             fi
           }
 
-          # Space leagues to avoid a six-request burst into one provider quota bucket.
           fetch_board MLB mlb.html MLB
-          sleep 20
+          sleep 10
           fetch_board NFL nfl.html NFL
-          sleep 20
+          sleep 10
           fetch_board NBA nba.html NBA
-          sleep 20
+          sleep 10
           fetch_board WNBA wnba.html WNBA
-          sleep 20
+          sleep 10
           fetch_board NCAAF ncaaf.html "College Football"
-          sleep 20
+          sleep 10
           fetch_board NCAAB ncaab.html "College Basketball"
 
       - name: Capture WNBA diagnostics only when useful
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
-          if [ -f .refresh-failed ] && grep -qx 'WNBA' .refresh-failed; then
-            # If every endpoint attempt was 503, the provider/backend path is already
-            # clearly degraded. Do not add diagnostic provider traffic that can prolong
-            # a rate-limit bucket. Preserve the failure evidence and let fallback recover.
-            non_503="$(grep -Ev ':(503|000)$' .refresh-attempts || true)"
-            if [ -z "$non_503" ]; then
-              echo "All board attempts were transport/provider 503/000; skipping WNBA diagnostics to avoid extra provider pressure."
-            else
-              curl -fsSL --connect-timeout 20 --max-time 120 \
-                "https://gamemode-80wa.onrender.com/diagnostics/board?leagueID=WNBA&windowHours=36" \
-                || echo "::warning::WNBA diagnostic endpoint unavailable"
-            fi
+          if [ -f .provider-degraded ]; then
+            echo "Provider circuit already confirmed degraded; no WNBA diagnostic traffic added."
+          elif [ -f .refresh-failed ] && grep -qx 'WNBA' .refresh-failed; then
+            curl -fsSL --connect-timeout 20 --max-time 120 \
+              "https://gamemode-80wa.onrender.com/diagnostics/board?leagueID=WNBA&windowHours=36" \
+              || echo "::warning::WNBA diagnostic endpoint unavailable"
           else
-            echo "WNBA did not fail; skipping extra provider diagnostic traffic."
+            echo "WNBA did not require diagnostics."
           fi
 
-      - name: Record complete refresh and build index
+      - name: Record refresh state and build index
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
           attempt_time="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          success_count="$(wc -l < .refresh-success 2>/dev/null || echo 0)"
           if [ ! -f .refresh-failed ]; then
             printf '%s\n' "$attempt_time" > last-successful-refresh.txt
             refresh_state="COMPLETE"
@@ -221,6 +221,12 @@ jobs:
           last_success="never"
           if [ -f last-successful-refresh.txt ]; then
             last_success="$(head -n1 last-successful-refresh.txt | tr -d '\r\n')"
+          fi
+
+          # Do not churn the public index when absolutely no league refreshed.
+          if [ "$success_count" -eq 0 ] && [ "$refresh_state" != "COMPLETE" ]; then
+            echo "No league refreshed successfully; preserving public index and all prior boards."
+            exit 0
           fi
 
           version="$(date -u +%Y%m%d%H%M%S)"
@@ -239,9 +245,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add index.html mlb.html nfl.html nba.html wnba.html ncaaf.html ncaab.html
-          if [ -f last-successful-refresh.txt ]; then
-            git add last-successful-refresh.txt
-          fi
+          if [ -f last-successful-refresh.txt ]; then git add last-successful-refresh.txt; fi
           if ! git diff --cached --quiet; then
             git commit -m "Update compact odds boards"
             git pull --rebase origin main
@@ -257,13 +261,14 @@ jobs:
           if [ -f .refresh-failed ]; then
             echo "Failed leagues after recovery attempts:"
             cat .refresh-failed
-            echo "One or more league refreshes genuinely failed or were incomplete. Successful leagues were published; previous valid failed-league boards were preserved; the complete-refresh marker was NOT advanced."
+            if [ -f .provider-degraded ]; then echo "Provider circuit was confirmed degraded; remaining calls were suppressed to protect recovery."; fi
+            echo "Complete-refresh marker was NOT advanced; previous valid failed-league boards remain authoritative."
             exit 1
           fi
-          echo "All league refreshes completed with valid complete board metadata. Complete-refresh marker advanced."
+          echo "All six league refreshes completed with valid metadata. Complete-refresh marker advanced."
 
       - name: Guarded fallback skipped
         if: steps.refresh_gate.outputs.run_refresh != 'true'
         shell: bash
         run: |
-          echo "Fallback schedule fired, but a recent COMPLETE six-league refresh already exists. No duplicate refresh needed."
+          echo "Fallback schedule fired, but a recent COMPLETE six-league refresh already exists."
