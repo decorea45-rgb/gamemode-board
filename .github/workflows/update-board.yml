@@ -16,15 +16,13 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     concurrency:
       group: gamemode-board-refresh
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
-          # Scheduled runs can sit queued behind the concurrency group. Check out
-          # the live branch at execution time instead of the stale trigger SHA.
           ref: main
 
       - name: Decide whether fallback refresh is needed
@@ -35,8 +33,8 @@ jobs:
           trigger_schedule="${{ github.event.schedule }}"
           echo "Trigger event=${{ github.event_name }} schedule=${trigger_schedule:-n/a}"
 
-          # IMPORTANT: fallback freshness is based only on the last COMPLETE
-          # six-league refresh. A failed/partial run must never suppress recovery.
+          # Fallback freshness is based ONLY on the last complete six-league refresh.
+          # A partial/failed run must never suppress recovery.
           if [ "${{ github.event_name }}" = "schedule" ] && [ "$trigger_schedule" = "27,57 * * * *" ]; then
             if [ -f last-successful-refresh.txt ]; then
               last_success="$(head -n1 last-successful-refresh.txt | tr -d '\r\n')"
@@ -66,8 +64,10 @@ jobs:
             echo "BACKEND PREFLIGHT attempt=${attempt} expected=${expected} observed=${version:-unavailable}"
             if [ "$version" = "$expected" ]; then
               echo "Deployed GameMode backend ${expected} confirmed and warm."
-              # Give the provider path a short quiet period before board traffic.
-              sleep 8
+              # Health can recover before the upstream provider's quota/rate bucket.
+              # Give provider traffic a real quiet period instead of immediately
+              # hammering six leagues after a wake-up.
+              sleep 30
               exit 0
             fi
             sleep 15
@@ -75,7 +75,7 @@ jobs:
           echo "::error::GameMode backend ${expected} was not observed after preflight wait."
           exit 1
 
-      - name: Fetch compact framework odds boards with recovery
+      - name: Fetch compact framework odds boards with provider-aware recovery
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
@@ -87,12 +87,16 @@ jobs:
             label="$3"
             success=false
 
-            for attempt in 1 2 3 4; do
-              rm -f full-board.html "${file}.new"
+            # Two endpoint attempts are deliberate. The backend itself already performs
+            # provider-side discovery/recovery. Repeatedly calling /board on 429/503
+            # amplified provider throttling and made recovery less likely.
+            for attempt in 1 2; do
+              rm -f full-board.html "${file}.new" response-headers.txt
               http_code="$(curl -sS -L --connect-timeout 20 --max-time 240 \
-                -o full-board.html -w '%{http_code}' \
+                -D response-headers.txt -o full-board.html -w '%{http_code}' \
                 "https://gamemode-80wa.onrender.com/board?leagueID=${league}&windowHours=36" || true)"
               [ -n "$http_code" ] || http_code="000"
+              echo "${league}:${http_code}" >> .refresh-attempts
               echo "FETCH ${label}: attempt=${attempt} http=${http_code}"
 
               if [ "$http_code" = "200" ] && [ -s full-board.html ]; then
@@ -144,46 +148,60 @@ jobs:
                 echo "::warning::${label} board request failed with HTTP ${http_code} on attempt ${attempt}."
               fi
 
-              if [ "$attempt" -lt 4 ]; then
-                case "$attempt" in
-                  1) delay=15 ;;
-                  2) delay=30 ;;
-                  *) delay=60 ;;
-                esac
-                echo "Retrying ${label} after ${delay}s cooldown."
+              if [ "$attempt" -lt 2 ]; then
+                retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {gsub("\r",""); print $2}' response-headers.txt | tail -n1)"
+                if [[ "$retry_after" =~ ^[0-9]+$ ]] && [ "$retry_after" -gt 0 ]; then
+                  delay="$retry_after"
+                  [ "$delay" -lt 90 ] && delay=90
+                  [ "$delay" -gt 300 ] && delay=300
+                elif [ "$http_code" = "429" ] || [ "$http_code" = "503" ]; then
+                  delay=120
+                else
+                  delay=45
+                fi
+                echo "Provider-aware cooldown for ${label}: ${delay}s before final attempt."
                 sleep "$delay"
               fi
             done
 
-            rm -f full-board.html "${file}.new"
+            rm -f full-board.html "${file}.new" response-headers.txt
 
             if [ "$success" != "true" ]; then
               echo "$league" >> .refresh-failed
-              echo "::error::${label} did not produce an acceptable board after recovery attempts; preserving previous ${file}."
+              echo "::error::${label} did not produce an acceptable board after provider-aware recovery; preserving previous ${file}."
               return 0
             fi
           }
 
+          # Space leagues to avoid a six-request burst into one provider quota bucket.
           fetch_board MLB mlb.html MLB
-          sleep 8
+          sleep 20
           fetch_board NFL nfl.html NFL
-          sleep 8
+          sleep 20
           fetch_board NBA nba.html NBA
-          sleep 8
+          sleep 20
           fetch_board WNBA wnba.html WNBA
-          sleep 8
+          sleep 20
           fetch_board NCAAF ncaaf.html "College Football"
-          sleep 8
+          sleep 20
           fetch_board NCAAB ncaab.html "College Basketball"
 
-      - name: Capture WNBA diagnostics only if refresh failed
+      - name: Capture WNBA diagnostics only when useful
         if: steps.refresh_gate.outputs.run_refresh == 'true'
         shell: bash
         run: |
           if [ -f .refresh-failed ] && grep -qx 'WNBA' .refresh-failed; then
-            curl -fsSL --connect-timeout 20 --max-time 120 \
-              "https://gamemode-80wa.onrender.com/diagnostics/board?leagueID=WNBA&windowHours=36" \
-              || echo "::warning::WNBA diagnostic endpoint unavailable"
+            # If every endpoint attempt was 503, the provider/backend path is already
+            # clearly degraded. Do not add diagnostic provider traffic that can prolong
+            # a rate-limit bucket. Preserve the failure evidence and let fallback recover.
+            non_503="$(grep -Ev ':(503|000)$' .refresh-attempts || true)"
+            if [ -z "$non_503" ]; then
+              echo "All board attempts were transport/provider 503/000; skipping WNBA diagnostics to avoid extra provider pressure."
+            else
+              curl -fsSL --connect-timeout 20 --max-time 120 \
+                "https://gamemode-80wa.onrender.com/diagnostics/board?leagueID=WNBA&windowHours=36" \
+                || echo "::warning::WNBA diagnostic endpoint unavailable"
+            fi
           else
             echo "WNBA did not fail; skipping extra provider diagnostic traffic."
           fi
