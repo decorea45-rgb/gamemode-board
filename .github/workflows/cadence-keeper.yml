@@ -1,0 +1,59 @@
+name: GameMode cadence keeper
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gamemode-cadence-keeper
+  cancel-in-progress: false
+
+jobs:
+  keeper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Check complete-refresh freshness
+        id: freshness
+        shell: bash
+        run: |
+          write_heartbeat=true
+          if [ -f last-successful-refresh.txt ]; then
+            last_success="$(head -n1 last-successful-refresh.txt | tr -d '\r\n')"
+            last_epoch="$(date -u -d "$last_success" +%s 2>/dev/null || echo 0)"
+            now_epoch="$(date -u +%s)"
+            age_seconds=$((now_epoch - last_epoch))
+            echo "Last complete refresh: ${last_success:-missing}; age_seconds=${age_seconds}"
+            if [ "$last_epoch" -gt 0 ] && [ "$age_seconds" -ge 0 ] && [ "$age_seconds" -lt 1200 ]; then
+              write_heartbeat=false
+            fi
+          fi
+          echo "write_heartbeat=$write_heartbeat" >> "$GITHUB_OUTPUT"
+
+      - name: Emit recovery heartbeat when refresh is stale
+        if: steps.freshness.outputs.write_heartbeat == 'true'
+        shell: bash
+        run: |
+          printf '%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > cadence-heartbeat.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cadence-heartbeat.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "GameMode cadence recovery heartbeat"
+            git pull --rebase origin main
+            git push
+          fi
+
+      - name: Recent complete refresh no-op
+        if: steps.freshness.outputs.write_heartbeat != 'true'
+        shell: bash
+        run: |
+          echo "Recent COMPLETE six-league refresh exists; no recovery heartbeat needed."
