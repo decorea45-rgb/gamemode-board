@@ -5,19 +5,68 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/refresh-now.yml"
+  schedule:
+    - cron: "7,37 * * * *"
   workflow_dispatch:
 
 permissions:
   actions: write
   contents: read
 
+concurrency:
+  group: gamemode-recovery-dispatch
+  cancel-in-progress: false
+
 jobs:
   dispatch-refresh:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Trigger current board refresh workflow
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Decide whether recovery dispatch is needed
+        id: gate
+        shell: bash
+        run: |
+          should_dispatch=true
+          reason="stale-or-missing-complete-refresh"
+          now_epoch="$(date -u +%s)"
+
+          if [ -f provider-cooldown-until.txt ]; then
+            cooldown_until="$(head -n1 provider-cooldown-until.txt | tr -d '\r\n')"
+            cooldown_epoch="$(date -u -d "$cooldown_until" +%s 2>/dev/null || echo 0)"
+            if [ "$cooldown_epoch" -gt "$now_epoch" ]; then
+              should_dispatch=false
+              reason="provider-cooldown"
+              echo "Provider cooldown active until ${cooldown_until}; recovery dispatch suppressed."
+            fi
+          fi
+
+          if [ "$should_dispatch" = "true" ] && [ -f last-successful-refresh.txt ]; then
+            last_success="$(head -n1 last-successful-refresh.txt | tr -d '\r\n')"
+            last_epoch="$(date -u -d "$last_success" +%s 2>/dev/null || echo 0)"
+            age_seconds=$((now_epoch - last_epoch))
+            echo "Last complete refresh: ${last_success:-missing}; age_seconds=${age_seconds}"
+            if [ "$last_epoch" -gt 0 ] && [ "$age_seconds" -ge 0 ] && [ "$age_seconds" -lt 1200 ]; then
+              should_dispatch=false
+              reason="recent-complete-refresh"
+            fi
+          fi
+
+          echo "should_dispatch=$should_dispatch" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger strict board recovery workflow
+        if: steps.gate.outputs.should_dispatch == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh workflow run update-board.yml --repo "${{ github.repository }}" --ref main
-          echo "Requested a fresh Update odds boards workflow_dispatch run on main."
+          echo "Requested strict Update odds boards recovery via workflow_dispatch."
+
+      - name: Recovery dispatch safely suppressed
+        if: steps.gate.outputs.should_dispatch != 'true'
+        run: |
+          echo "No recovery dispatch: ${{ steps.gate.outputs.reason }}"
